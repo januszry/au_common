@@ -113,7 +113,7 @@ class AudioProber(object):
         tracks = {}
         for proto in self.possible_protocols:
             url = proto + '://' + self._url_without_proto
-            if not tricks.is_ascii(url):
+            if proto != 'file' and not tricks.is_ascii(url):
                 url = tricks.url_fix(url)
             input_options = list(self._input_options)
             if proto == 'rtsp':
