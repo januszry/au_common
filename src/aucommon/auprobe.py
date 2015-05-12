@@ -101,6 +101,8 @@ class AudioProber(object):
                 self._best_track_index in self._tracks:
             return self._tracks[self._best_track_index]
         self._get_audio_tracks()
+        if self.tracks is None:
+            raise InvalidURL(self._url)
         return self._get_best_track()
 
     @property
@@ -225,9 +227,8 @@ class AudioProber(object):
 def select_best_protocol_for_stream(url, **kwargs):
     ap = AudioProber(url, **kwargs)
     best_track = ap.best_track
-    if best_track:
-        best_track['con_time'] = ap._con_time
-        best_track['selected_protocol'] = ap._proto
+    best_track['con_time'] = ap._con_time
+    best_track['selected_protocol'] = ap._proto
     return best_track
 
 
