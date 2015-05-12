@@ -103,6 +103,14 @@ class AudioProber(object):
         self._get_audio_tracks()
         return self._get_best_track()
 
+    @property
+    def best_url(self):
+        if self._ori_proto == 'file':
+            return self._url
+        if not self._proto:
+            self._get_best_track()
+        return self._proto + '://' + self._url_without_proto
+
     def _get_audio_tracks(self):
         """Probe a url to get all audio tracks.
 
@@ -110,7 +118,7 @@ class AudioProber(object):
         Will return a dict:
             {proto: {track_index: track_info}}"""
 
-        tracks = {}
+        streams = {}
         for proto in self.possible_protocols:
             url = proto + '://' + self._url_without_proto
             if proto != 'file' and not tricks.is_ascii(url):
@@ -168,20 +176,22 @@ class AudioProber(object):
                 tracks_for_current_proto = None
 
             avg_conn_time = sum(probing_time) / len(probing_time)
-            tracks[proto] = {
+            streams[proto] = {
                 'proto': proto,
                 'con_time': avg_conn_time,
                 'tracks': tracks_for_current_proto,
                 }
-        self._logger.info(pprint.pformat(tracks))
-        info_of_selected_track = min(
-            tracks.values(), key=lambda x: x['con_time'])
-        self._con_time = info_of_selected_track['con_time']
-        self._proto = info_of_selected_track['proto']
-        self._tracks = info_of_selected_track['tracks']
-        return self._tracks
+        self._logger.info(pprint.pformat(streams))
+        valid_tracks = [i for i in streams.values() if i['tracks'] is not None]
+        if valid_tracks:
+            info_of_selected_track = min(valid_tracks,
+                                         key=lambda x: x['con_time'])
+            self._con_time = info_of_selected_track['con_time']
+            self._proto = info_of_selected_track['proto']
+            self._tracks = info_of_selected_track['tracks']
+            return self._tracks
 
-    def _get_best_track(self, flush=False):
+    def _get_best_track(self):
         """Get best track.
 
         1. select tracks with almost longest duration;
@@ -215,8 +225,9 @@ class AudioProber(object):
 def select_best_protocol_for_stream(url, **kwargs):
     ap = AudioProber(url, **kwargs)
     best_track = ap.best_track
-    best_track['con_time'] = ap._con_time
-    best_track['selected_protocol'] = ap._proto
+    if best_track:
+        best_track['con_time'] = ap._con_time
+        best_track['selected_protocol'] = ap._proto
     return best_track
 
 
@@ -233,7 +244,7 @@ def main():
     parser.add_argument('-t', '--timeout', type=int,
                         default=10, help='timeout for probing')
     parser.add_argument('-f', '--retry_times', type=int,
-                        default=5, help='retry times for probing protocol')
+                        default=3, help='retry times for probing protocol')
     args = parser.parse_args()
 
     # set up logging
@@ -241,6 +252,10 @@ def main():
     logger = logging.getLogger(__name__)
     logger.info('-' * 40 + '<%s>' + '-' * 40, time.asctime())
     logger.info('Arguments: %s', args)
+
+    # ap = AudioProber(args.url, args.input_options,
+    #                  args.repeat_times, args.timeout, args.retry_times)
+    # pprint.pprint(ap.best_url)
 
     pprint.pprint(
         select_best_protocol_for_stream(
