@@ -19,8 +19,7 @@ setup(
     platforms="Independant",
     url="",
     entry_points={'console_scripts': [
-        'auprober=aucommon.auprobe:main',
-        'wavanalyze=aucommon.wavfile:main',
+        'auprobe=aucommon.auprobe:main',
         ]},
 
     install_requires=["requests>=2.3.0",

@@ -19,6 +19,8 @@ WEIGHT_OF_CODEC = {
 }
 
 NONEXIST = -1
+CHANNEL_FULL = -1
+CHANNEL_INVERTED = -2
 TIME_PUNISHMENT = 100
 
 
@@ -30,24 +32,41 @@ class AudioProber(object):
 
     """Audio Prober for local files and urls (only for ffprobe).
 
-    Basic probing probes protocol, track,
+    Probes protocol, track,
         codec, profile, container, duration,
-        bitrate, sample_rate, channel;
-    Detailed probing probes volume, loudness(ebur128), and issues such as
-        inversion, one-sided"""
+        bitrate, sample_rate, channel."""
 
     def __init__(self, url, input_options=[],
-                 repeat_times=3, timeout=10, retry_times=5):
+                 repeat_times=3, timeout=10, retry_times=5,
+                 min_len=7, max_len=14):
+        """Prober.
+
+        Volume and loudness are only for the best_track.
+
+        :param url: url provided as input, can be local file
+        :param input_options: a list of ffmpeg input options
+        :param repeat_times: times to repeat protocol probing to get con_time
+        :param timeout: timeout of probing
+        :param retry_times: times of retries to try probing
+        :param min_len: min length to get volume / loudness of input
+        :param max_len: max length to get volume / loudness of input."""
+
         self._url = url
         self._input_options = input_options
         self._repeat_times = repeat_times
         self._timeout = timeout
         self._retry_times = retry_times
+        self._min_len = min_len
+        self._max_len = max_len
 
         self._proto = None
         self._tracks = None  # a dict keyed of track-index
         self._con_time = None
         self._best_track_index = None
+
+        self._volume = None
+        self._loudness = None
+
         self._logger = logging.getLogger(__name__)
 
         if '://' not in self._url:  # local file
@@ -97,7 +116,8 @@ class AudioProber(object):
 
     @property
     def best_track(self):
-        if self._tracks is not None and self._best_track_index and \
+        if self._tracks is not None and \
+                self._best_track_index is not None and \
                 self._best_track_index in self._tracks:
             return self._tracks[self._best_track_index]
         self._get_audio_tracks()
@@ -113,6 +133,173 @@ class AudioProber(object):
             self._get_best_track()
         return self._proto + '://' + self._url_without_proto
 
+    @property
+    def volume(self):
+        if self._volume is not None:
+            return self._volume
+        self._get_volume_and_loudness()
+        return self._volume
+
+    @property
+    def loudness(self):
+        if self._loudness is not None:
+            return self._loudness
+        self._get_volume_and_loudness()
+        return self._loudness
+
+    def _get_volume_and_loudness(self):
+        """Get volume and ebur128 loudness.
+
+        Get volume with FFMPEG and audio filter volumedetect.
+        Get loudness with FFMPEG and filter_complex ebur128.
+
+        volumedetect result example:
+        [Parsed_volumedetect_0 @ 0x7fe66361a000] n_samples: 672064
+        [Parsed_volumedetect_0 @ 0x7fe66361a000] mean_volume: -22.2 dB
+        [Parsed_volumedetect_0 @ 0x7fe66361a000] max_volume: -9.4 dB
+        [Parsed_volumedetect_0 @ 0x7fe66361a000] histogram_9db: 11
+        [Parsed_volumedetect_0 @ 0x7fe66361a000] histogram_10db: 642
+        [Parsed_volumedetect_0 @ 0x7fe66361a000] histogram_11db: 3868
+
+        ebur128 result example:
+        [Parsed_ebur128_1 @ 0x7fe663400c40] Summary:
+
+          Integrated loudness:
+            I:         -27.9 LUFS
+            Threshold: -37.9 LUFS
+
+          Loudness range:
+            LRA:         0.8 LU
+            Threshold: -47.5 LUFS
+            LRA low:   -28.0 LUFS
+            LRA high:  -27.2 LUFS"""
+        duration = self.best_track['duration']
+
+        if duration < self._min_len:
+            duration = self._min_len
+        elif duration > self._max_len:
+            duration = self._max_len
+
+        index = self.best_track['index']
+        # a filter_complex graph to get volume and loudness of each channel
+        filter_complex_list = ['[0:{}]volumedetect,ebur128[cfull]'.format(
+            index)]
+        # module_data indexed by module index
+        module_data = {
+            0: {'name': 'volumedetect',
+                'channel': CHANNEL_FULL,
+                'volume_mean': None,
+                'volume_max': None,
+                },
+            1: {'name': 'ebur128',
+                'channel': CHANNEL_FULL,
+                'loudness': None,
+                },
+            }
+
+        for i in range(self.best_track['channels']):
+            filter_complex_list.append(
+                '[0:{}]pan=mono|c0=c{},volumedetect,ebur128[c{}]'.format(
+                    index, i, i))
+            # pan, volumedetect and ebur128 are 3 modules
+            module_data[1 + 3 * i + 2] = {
+                'name': 'volumedetect',
+                'channel': i,
+                'volume_mean': None,
+                'volume_max': None,
+                }
+            module_data[1 + 3 * i + 3] = {
+                'name': 'ebur128',
+                'channel': i,
+                'loudness': None,
+                }
+
+        # if stereo, add inversion check
+        if self.best_track['channels'] == 2:
+            filter_complex_list.append(
+                '[0:{}]pan=mono|c0=c0+c1'
+                ',volumedetect,ebur128[cinverted]'.format(
+                    index))
+            module_data[1 + 3 * self.best_track['channels'] + 2] = {
+                'name': 'volumedetect',
+                'channel': CHANNEL_INVERTED,
+                'volume_mean': None,
+                'volume_max': None,
+                }
+            module_data[1 + 3 * self.best_track['channels'] + 3] = {
+                'name': 'ebur128',
+                'channel': CHANNEL_INVERTED,
+                'loudness': None,
+                }
+
+        url = self.best_url
+        input_options = list(self._input_options)
+        if self._proto == 'rtsp':
+            input_options = ['-rtsp_transport', 'tcp'] + input_options
+        elif self._proto == 'rtmp':
+            url = url + ' live=1'
+
+        cmd = ['ffmpeg', '-t', str(duration)] + input_options + \
+            ['-i', url,
+             '-filter_complex', ';'.join(filter_complex_list)] + \
+            ['-map', '[cfull]', '-f', 'null', '-']
+        for i in range(self.best_track['channels']):
+            cmd += ['-map', '[c{}]'.format(i), '-f', 'null', '-']
+        if self.best_track['channels'] == 2:
+            cmd += ['-map', '[cinverted]', '-f', 'null', '-']
+
+        self._logger.info(
+            'Checking volume and loudness of track %s of %s, lenth: %s',
+            self.best_track,
+            self.best_url,
+            duration)
+        output = subprocess.check_output(
+            cmd, timeout=self._timeout,
+            stderr=subprocess.STDOUT).splitlines()
+
+        in_ebur128_summary_flag = False
+        current_ebur128_module_index = None
+        for line in output:
+            line = line.decode('utf-8', 'ignore').strip()
+            # if line is not in a summary of ebur128, skip
+            if not in_ebur128_summary_flag and not line.startswith('['):
+                continue
+            if in_ebur128_summary_flag and \
+                    line.startswith('I:') and line.endswith('LUFS'):
+                module_data[current_ebur128_module_index][
+                    'loudness'] = float(
+                        line.split()[-2])
+                in_ebur128_summary_flag = False
+                current_ebur128_module_index = None
+            elif line.startswith('[Parsed_ebur128_') and 'Summary' in line:
+                current_ebur128_module_index = int(
+                    line.split()[0].split('_')[-1])
+                in_ebur128_summary_flag = True
+
+            elif line.startswith('[Parsed_volumedetect_') and \
+                    'mean_volume' in line:
+                line_split = line.split()
+                index = int(line_split[0].split('_')[-1])
+                module_data[index]['volume_mean'] = float(line_split[-2])
+            elif line.startswith('[Parsed_volumedetect_') and \
+                    'max_volume' in line:
+                line_split = line.split()
+                index = int(line_split[0].split('_')[-1])
+                module_data[index]['volume_max'] = float(line_split[-2])
+
+        volume = {}
+        loudness = {}
+        pprint.pprint(module_data)
+        for k, v in module_data.items():
+            if v['name'] == 'volumedetect':
+                volume[v['channel']] = {
+                    'volume_max': v['volume_max'],
+                    'volume_mean': v['volume_mean']}
+            elif v['name'] == 'ebur128':
+                loudness[v['channel']] = v['loudness']
+        self._volume = volume
+        self._loudness = loudness
+
     def _get_audio_tracks(self):
         """Probe a url to get all audio tracks.
 
@@ -122,7 +309,10 @@ class AudioProber(object):
 
         streams = {}
         for proto in self.possible_protocols:
-            url = proto + '://' + self._url_without_proto
+            if proto == 'file':
+                url = self._url
+            else:
+                url = proto + '://' + self._url_without_proto
             if proto != 'file' and not tricks.is_ascii(url):
                 url = tricks.url_fix(url)
             input_options = list(self._input_options)
