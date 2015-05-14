@@ -22,6 +22,9 @@ NONEXIST = -1
 CHANNEL_ORI = -1
 CHANNEL_MERGED = -2
 TIME_PUNISHMENT = 100
+LOUDNESS_MIN = -16
+LOUDNESS_MAX = -12
+LOUDNESS_TAR = -14
 
 
 class InvalidURL(Exception):
@@ -38,7 +41,7 @@ class AudioProber(object):
 
     def __init__(self, url, input_options=[],
                  repeat_times=3, timeout=10, retry_times=5,
-                 min_len=10, max_len=20):
+                 min_len=10, max_len=20, force_proto=False):
         """Prober.
 
         Volume and loudness are only for the best_track.
@@ -58,6 +61,7 @@ class AudioProber(object):
         self._retry_times = retry_times
         self._min_len = min_len
         self._max_len = max_len
+        self._force_proto = force_proto
 
         self._proto = None
         self._tracks = None  # a dict keyed of track-index
@@ -81,9 +85,43 @@ class AudioProber(object):
         else:
             (self._ori_proto,
              self._url_without_proto) = self._url.split('://', 1)
+        if self._force_proto:
+            self._logger.info("Forcing protocol to be %s", self._ori_proto)
 
     def __str__(self):
         return pprint.pformat(vars(self))
+
+    @property
+    def output_options(self):
+        output_options = []
+        index = self.best_track['index']
+
+        if self.is_inverted or self.is_ll or self.best_track['channels'] != 2:
+            channel_selected = 0
+            output_options.extend(  # select left channel
+                ['-map_channel', '0.{}.0'.format(index),
+                 '-map_channel', '0.{}.0'.format(index)])
+        elif self.is_rr:
+            channel_selected = 1
+            output_options.extend(  # select left channel
+                ['-map_channel', '0.{}.1'.format(index),
+                 '-map_channel', '0.{}.1'.format(index)])
+        else:
+            channel_selected = CHANNEL_ORI
+
+        loudness = self.loudness[channel_selected]
+        volume_max = self.volume[channel_selected]['volume_max']
+        volume_adjust = None
+        if loudness > LOUDNESS_MAX:
+            volume_adjust = LOUDNESS_TAR - loudness
+        elif loudness < LOUDNESS_MIN:
+            volume_adjust = min(
+                LOUDNESS_TAR - loudness, 0 - volume_max)
+        if volume_adjust:
+            output_options.extend(
+                ['-af', 'volume={:+.2f}dB'.format(volume_adjust)])
+
+        return output_options
 
     @property
     def is_inverted(self):
@@ -147,7 +185,9 @@ class AudioProber(object):
             'rtspt', 'rtsp').replace('rtmpt', 'rtmp')
 
         # list possible protos
-        if proto == 'file':
+        if self._force_proto:
+            return [proto]
+        elif proto == 'file':
             return ['file']
         elif proto == 'rtmp':
             return ['rtmp']
@@ -171,8 +211,7 @@ class AudioProber(object):
                 self._best_track_index is not None and \
                 self._best_track_index in self._tracks:
             return self._tracks[self._best_track_index]
-        self._get_audio_tracks()
-        if self.tracks is None:
+        if self._get_audio_tracks() is None:
             raise InvalidURL(self._url)
         return self._get_best_track()
 
@@ -299,13 +338,18 @@ class AudioProber(object):
         if self.best_track['channels'] == 2:
             cmd += ['-map', '[cinverted]', '-f', 'null', '-']
 
+        timeout = max(self._timeout, self._con_time * 2)
         self._logger.info(
-            'Checking volume and loudness of best track %s of %s, lenth: %s',
+            'Checking volume and loudness of best track %s of %s, '
+            'length: %s, timeout: %s',
             pprint.pformat(self.best_track),
             self.best_url,
-            self._tested_duration)
+            self._tested_duration,
+            timeout)
+
+        # timeout is adjusted according to con_time
         output = subprocess.check_output(
-            cmd, timeout=self._timeout,
+            cmd, timeout=timeout,
             stderr=subprocess.STDOUT).splitlines()
 
         in_ebur128_summary_flag = False
@@ -353,7 +397,7 @@ class AudioProber(object):
     def _get_audio_tracks(self):
         """Probe a url to get all audio tracks.
 
-        Will try every possible protocol for given schema.
+        Will try every possible protocol for given scheme.
         Will return a dict:
             {proto: {track_index: track_info}}"""
 
@@ -378,10 +422,25 @@ class AudioProber(object):
             probing_time = []
             for i in range(self._repeat_times):
                 try:
-                    start_time = time.time()
-                    tmp_data = tricks.retry(
-                        self._retry_times, subprocess.check_output,
-                        cmd, timeout=self._timeout)
+                    tmp_data = None
+                    te = None
+                    for i in range(self._retry_times):
+                        start_time = time.time()
+                        if self._timeout is not None:
+                            timeout = self._timeout * (1 + i / 2)
+                            self._logger.info(
+                                'Adjusting timeout to %s', timeout)
+                        else:
+                            timeout = None
+                        try:
+                            tmp_data = subprocess.check_output(
+                                cmd, timeout=timeout)
+                        except Exception as e:
+                            te = e
+                        else:
+                            break
+                    if tmp_data is None and te is not None:
+                        raise te
                 except subprocess.CalledProcessError as e:
                     self._logger.warning('Called Process Error: %s', e)
                     probing_time.append(TIME_PUNISHMENT)
@@ -468,6 +527,9 @@ def probe_and_select_from_stream(url, **kwargs):
     ap = AudioProber(url, **kwargs)
     ap._get_volume_and_loudness()
     result = dict(ap.best_track)
+    result['input_options'] = ap._input_options
+    result['output_options'] = ap.output_options
+    result['best_url'] = ap.best_url
     result['tested_duration'] = ap._tested_duration
     result['con_time'] = ap._con_time
     result['selected_protocol'] = ap._proto
@@ -490,13 +552,15 @@ def main():
     parser.add_argument('url', help='local file / url to probe')
     parser.add_argument('-i', '--input_options',
                         type=lambda x: shlex.split(x),
-                        default='', help='prober')
+                        default=[], help='prober')
     parser.add_argument('-r', '--repeat_times', type=int,
                         default=3, help='repeat times for probing protocol')
     parser.add_argument('-t', '--timeout', type=int,
-                        default=20, help='timeout for probing')
+                        default=5, help='timeout for probing')
     parser.add_argument('-f', '--retry_times', type=int,
-                        default=2, help='retry times for probing protocol')
+                        default=3, help='retry times for probing protocol')
+    parser.add_argument('--force_proto', action='store_true',
+                        help='use scheme in url as proto')
     args = parser.parse_args()
 
     # set up logging
@@ -505,13 +569,14 @@ def main():
     logger.info('-' * 40 + '<%s>' + '-' * 40, time.asctime())
     logger.info('Arguments: %s', args)
 
-    logger.info(pprint.pformat(
+    logger.info('\n' + pprint.pformat(
         probe_and_select_from_stream(
             args.url,
             input_options=args.input_options,
             repeat_times=args.repeat_times,
             timeout=args.timeout,
-            retry_times=args.retry_times)))
+            retry_times=args.retry_times,
+            force_proto=args.force_proto)))
 
 
 if __name__ == '__main__':
