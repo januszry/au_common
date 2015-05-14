@@ -338,7 +338,10 @@ class AudioProber(object):
         if self.best_track['channels'] == 2:
             cmd += ['-map', '[cinverted]', '-f', 'null', '-']
 
-        timeout = max(self._timeout, self._con_time * 2)
+        if self._timeout is None:
+            timeout = None
+        else:  # TODO: timeout adjustment
+            timeout = max(self._timeout, self._con_time * 2)
         self._logger.info(
             'Checking volume and loudness of best track %s of %s, '
             'length: %s, timeout: %s',
@@ -347,7 +350,6 @@ class AudioProber(object):
             self._tested_duration,
             timeout)
 
-        # timeout is adjusted according to con_time
         output = subprocess.check_output(
             cmd, timeout=timeout,
             stderr=subprocess.STDOUT).splitlines()
@@ -427,6 +429,7 @@ class AudioProber(object):
                     for i in range(self._retry_times):
                         start_time = time.time()
                         if self._timeout is not None:
+                            # TODO: timeout adjustment
                             timeout = self._timeout * (1 + i / 2)
                             self._logger.info(
                                 'Adjusting timeout to %s', timeout)
