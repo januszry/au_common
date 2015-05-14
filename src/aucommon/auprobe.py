@@ -19,8 +19,8 @@ WEIGHT_OF_CODEC = {
 }
 
 NONEXIST = -1
-CHANNEL_FULL = -1
-CHANNEL_INVERTED = -2
+CHANNEL_ORI = -1
+CHANNEL_MERGED = -2
 TIME_PUNISHMENT = 100
 
 
@@ -38,7 +38,7 @@ class AudioProber(object):
 
     def __init__(self, url, input_options=[],
                  repeat_times=3, timeout=10, retry_times=5,
-                 min_len=7, max_len=14):
+                 min_len=10, max_len=20):
         """Prober.
 
         Volume and loudness are only for the best_track.
@@ -63,6 +63,7 @@ class AudioProber(object):
         self._tracks = None  # a dict keyed of track-index
         self._con_time = None
         self._best_track_index = None
+        self._tested_duration = None
 
         self._volume = None
         self._loudness = None
@@ -75,6 +76,7 @@ class AudioProber(object):
             self._ori_proto = 'file'
             self._url_without_proto = self._url
             self._repeat_times = 1
+            self._timeout = None
             self._retry_times = 1
         else:
             (self._ori_proto,
@@ -82,6 +84,55 @@ class AudioProber(object):
 
     def __str__(self):
         return pprint.pformat(vars(self))
+
+    @property
+    def is_inverted(self):
+        if self.best_track['channels'] != 2:
+            return False
+        if self.is_ll or self.is_rr:
+            return False
+
+        if self.volume[CHANNEL_MERGED]['volume_mean'] + 10 \
+                <= self.volume[CHANNEL_ORI]['volume_mean']:
+            return True
+        else:
+            return False
+
+    @property
+    def is_ll(self):
+        if self.best_track['channels'] != 2:
+            return False
+
+        if self.volume[1]['volume_mean'] + 10 \
+                <= self.volume[0]['volume_mean']:
+            return True
+        else:
+            return False
+
+    @property
+    def is_rr(self):
+        if self.best_track['channels'] != 2:
+            return False
+
+        if self.volume[0]['volume_mean'] + 10 \
+                <= self.volume[1]['volume_mean']:
+            return True
+        else:
+            return False
+
+    @property
+    def is_too_loud(self):
+        if self.volume[CHANNEL_ORI]['volume_max'] == 0.0:
+            return True
+        else:
+            return False
+
+    @property
+    def is_too_low(self):
+        if self.volume[CHANNEL_ORI]['volume_mean'] <= -30.0:
+            return True
+        else:
+            return False
 
     @property
     def possible_protocols(self):
@@ -173,12 +224,12 @@ class AudioProber(object):
             Threshold: -47.5 LUFS
             LRA low:   -28.0 LUFS
             LRA high:  -27.2 LUFS"""
-        duration = self.best_track['duration']
+        self._tested_duration = self.best_track['duration']
 
-        if duration < self._min_len:
-            duration = self._min_len
-        elif duration > self._max_len:
-            duration = self._max_len
+        if self._tested_duration < self._min_len:
+            self._tested_duration = self._min_len
+        elif self._proto != 'file' and self._tested_duration > self._max_len:
+            self._tested_duration = self._max_len
 
         index = self.best_track['index']
         # a filter_complex graph to get volume and loudness of each channel
@@ -187,12 +238,12 @@ class AudioProber(object):
         # module_data indexed by module index
         module_data = {
             0: {'name': 'volumedetect',
-                'channel': CHANNEL_FULL,
+                'channel': CHANNEL_ORI,
                 'volume_mean': None,
                 'volume_max': None,
                 },
             1: {'name': 'ebur128',
-                'channel': CHANNEL_FULL,
+                'channel': CHANNEL_ORI,
                 'loudness': None,
                 },
             }
@@ -217,18 +268,18 @@ class AudioProber(object):
         # if stereo, add inversion check
         if self.best_track['channels'] == 2:
             filter_complex_list.append(
-                '[0:{}]pan=mono|c0=c0+c1'
+                '[0:{}]pan=mono|c0=0.5*c0+0.5*c1'
                 ',volumedetect,ebur128[cinverted]'.format(
                     index))
             module_data[1 + 3 * self.best_track['channels'] + 2] = {
                 'name': 'volumedetect',
-                'channel': CHANNEL_INVERTED,
+                'channel': CHANNEL_MERGED,
                 'volume_mean': None,
                 'volume_max': None,
                 }
             module_data[1 + 3 * self.best_track['channels'] + 3] = {
                 'name': 'ebur128',
-                'channel': CHANNEL_INVERTED,
+                'channel': CHANNEL_MERGED,
                 'loudness': None,
                 }
 
@@ -239,7 +290,7 @@ class AudioProber(object):
         elif self._proto == 'rtmp':
             url = url + ' live=1'
 
-        cmd = ['ffmpeg', '-t', str(duration)] + input_options + \
+        cmd = ['ffmpeg', '-t', str(self._tested_duration)] + input_options + \
             ['-i', url,
              '-filter_complex', ';'.join(filter_complex_list)] + \
             ['-map', '[cfull]', '-f', 'null', '-']
@@ -249,10 +300,10 @@ class AudioProber(object):
             cmd += ['-map', '[cinverted]', '-f', 'null', '-']
 
         self._logger.info(
-            'Checking volume and loudness of track %s of %s, lenth: %s',
-            self.best_track,
+            'Checking volume and loudness of best track %s of %s, lenth: %s',
+            pprint.pformat(self.best_track),
             self.best_url,
-            duration)
+            self._tested_duration)
         output = subprocess.check_output(
             cmd, timeout=self._timeout,
             stderr=subprocess.STDOUT).splitlines()
@@ -289,7 +340,6 @@ class AudioProber(object):
 
         volume = {}
         loudness = {}
-        pprint.pprint(module_data)
         for k, v in module_data.items():
             if v['name'] == 'volumedetect':
                 volume[v['channel']] = {
@@ -414,12 +464,23 @@ class AudioProber(object):
         return best_track
 
 
-def select_best_protocol_for_stream(url, **kwargs):
+def probe_and_select_from_stream(url, **kwargs):
     ap = AudioProber(url, **kwargs)
-    best_track = ap.best_track
-    best_track['con_time'] = ap._con_time
-    best_track['selected_protocol'] = ap._proto
-    return best_track
+    ap._get_volume_and_loudness()
+    result = dict(ap.best_track)
+    result['tested_duration'] = ap._tested_duration
+    result['con_time'] = ap._con_time
+    result['selected_protocol'] = ap._proto
+    result['volume'] = ap.volume
+    result['loudness'] = ap.loudness
+    result['abnormals'] = {
+        'inverted': ap.is_inverted,
+        'll': ap.is_ll,
+        'rr': ap.is_rr,
+        'too_loud': ap.is_too_loud,
+        'too_low': ap.is_too_low,
+        }
+    return result
 
 
 def main():
@@ -433,9 +494,9 @@ def main():
     parser.add_argument('-r', '--repeat_times', type=int,
                         default=3, help='repeat times for probing protocol')
     parser.add_argument('-t', '--timeout', type=int,
-                        default=10, help='timeout for probing')
+                        default=20, help='timeout for probing')
     parser.add_argument('-f', '--retry_times', type=int,
-                        default=3, help='retry times for probing protocol')
+                        default=2, help='retry times for probing protocol')
     args = parser.parse_args()
 
     # set up logging
@@ -444,17 +505,13 @@ def main():
     logger.info('-' * 40 + '<%s>' + '-' * 40, time.asctime())
     logger.info('Arguments: %s', args)
 
-    # ap = AudioProber(args.url, args.input_options,
-    #                  args.repeat_times, args.timeout, args.retry_times)
-    # pprint.pprint(ap.best_url)
-
-    pprint.pprint(
-        select_best_protocol_for_stream(
+    logger.info(pprint.pformat(
+        probe_and_select_from_stream(
             args.url,
             input_options=args.input_options,
             repeat_times=args.repeat_times,
             timeout=args.timeout,
-            retry_times=args.retry_times))
+            retry_times=args.retry_times)))
 
 
 if __name__ == '__main__':
