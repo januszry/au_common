@@ -107,6 +107,9 @@ class AudioProber(object):
                 ['-map_channel', '0.{}.1'.format(index),
                  '-map_channel', '0.{}.1'.format(index)])
         else:
+            output_options.extend(
+                ['-map_channel', '0.{}.0'.format(index),
+                 '-map_channel', '0.{}.1'.format(index)])
             channel_selected = CHANNEL_ORI
 
         loudness = self.loudness[channel_selected]
