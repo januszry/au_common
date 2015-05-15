@@ -55,13 +55,18 @@ class AudioProber(object):
         :param max_len: max length to get volume / loudness of input."""
 
         self._url = url
-        self._input_options = input_options
         self._repeat_times = repeat_times
         self._timeout = timeout
         self._retry_times = retry_times
         self._min_len = min_len
         self._max_len = max_len
         self._force_proto = force_proto
+
+        self.input_options = input_options
+
+        self.inverted_confidence = None
+        self.ll_confidence = None
+        self.rr_confidence = None
 
         self._proto = None
         self._tracks = None  # a dict keyed of track-index
@@ -133,8 +138,10 @@ class AudioProber(object):
         if self.is_ll or self.is_rr:
             return False
 
-        if self.volume[CHANNEL_MERGED]['volume_mean'] + 10 \
+        if self.volume[CHANNEL_MERGED]['volume_mean'] + 7 \
                 <= self.volume[CHANNEL_ORI]['volume_mean']:
+            self.inverted_confidence = min(  # TODO: confidence of inverted
+                100, - self.volume[CHANNEL_MERGED]['volume_mean'] / 70.0 * 100)
             return True
         else:
             return False
@@ -144,8 +151,12 @@ class AudioProber(object):
         if self.best_track['channels'] != 2:
             return False
 
-        if self.volume[1]['volume_mean'] + 10 \
+        if self.volume[1]['volume_mean'] + 7 \
                 <= self.volume[0]['volume_mean']:
+            self.ll_confidence = min(  # TODO: confidence of inverted
+                100,
+                (self.volume[0]['volume_mean'] -
+                 self.volume[1]['volume_mean']) / 20 * 100)
             return True
         else:
             return False
@@ -155,8 +166,12 @@ class AudioProber(object):
         if self.best_track['channels'] != 2:
             return False
 
-        if self.volume[0]['volume_mean'] + 10 \
+        if self.volume[0]['volume_mean'] + 7 \
                 <= self.volume[1]['volume_mean']:
+            self.rr_confidence = min(  # TODO: confidence of inverted
+                100,
+                (self.volume[1]['volume_mean'] -
+                 self.volume[0]['volume_mean']) / 20 * 100)
             return True
         else:
             return False
@@ -326,7 +341,7 @@ class AudioProber(object):
                 }
 
         url = self.best_url
-        input_options = list(self._input_options)
+        input_options = list(self.input_options)
         if self._proto == 'rtsp':
             input_options = ['-rtsp_transport', 'tcp'] + input_options
         elif self._proto == 'rtmp':
@@ -345,6 +360,8 @@ class AudioProber(object):
             timeout = None
         else:  # TODO: timeout adjustment
             timeout = max(self._timeout, self._con_time * 2)
+            if self.best_track['duration'] == 0.0:  # live stream
+                timeout = max(self._tested_duration, timeout)
         self._logger.info(
             'Checking volume and loudness of best track %s of %s, '
             'length: %s, timeout: %s',
@@ -414,7 +431,7 @@ class AudioProber(object):
                 url = proto + '://' + self._url_without_proto
             if proto != 'file' and not tricks.is_ascii(url):
                 url = tricks.url_fix(url)
-            input_options = list(self._input_options)
+            input_options = list(self.input_options)
             if proto == 'rtsp':
                 input_options = ['-rtsp_transport', 'tcp'] + input_options
             elif proto == 'rtmp':
@@ -533,7 +550,7 @@ def probe_and_select_from_stream(url, **kwargs):
     ap = AudioProber(url, **kwargs)
     ap._get_volume_and_loudness()
     result = dict(ap.best_track)
-    result['input_options'] = ap._input_options
+    result['input_options'] = ap.input_options
     result['output_options'] = ap.output_options
     result['best_url'] = ap.best_url
     result['tested_duration'] = ap._tested_duration
@@ -543,8 +560,11 @@ def probe_and_select_from_stream(url, **kwargs):
     result['loudness'] = ap.loudness
     result['abnormals'] = {
         'inverted': ap.is_inverted,
+        'inverted_confidence': ap.inverted_confidence,
         'll': ap.is_ll,
+        'll_confidence': ap.ll_confidence,
         'rr': ap.is_rr,
+        'rr_confidence': ap.rr_confidence,
         'too_loud': ap.is_too_loud,
         'too_low': ap.is_too_low,
         }
@@ -562,7 +582,7 @@ def main():
     parser.add_argument('-r', '--repeat_times', type=int,
                         default=3, help='repeat times for probing protocol')
     parser.add_argument('-t', '--timeout', type=int,
-                        default=5, help='timeout for probing')
+                        default=7, help='timeout for probing')
     parser.add_argument('-f', '--retry_times', type=int,
                         default=3, help='retry times for probing protocol')
     parser.add_argument('--force_proto', action='store_true',
